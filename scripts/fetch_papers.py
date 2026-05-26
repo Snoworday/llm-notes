@@ -43,19 +43,44 @@ LLM_MODEL = "gpt-4o-mini"   # 或者 gpt-4o / gpt-4.1-mini
 
 # ============ arXiv 抓取 ============
 
-def fetch_arxiv_papers():
-    """抓取最近 2 天的 arXiv 论文"""
+def fetch_arxiv_papers(max_retries=5):
+    """抓取最新的 arXiv 论文。带礼貌的 User-Agent 和指数退避重试。"""
     cat_query = "+OR+".join(f"cat:{c}" for c in ARXIV_CATEGORIES)
     url = (
-        "http://export.arxiv.org/api/query?"
+        "https://export.arxiv.org/api/query?"
         f"search_query={cat_query}"
         "&sortBy=submittedDate&sortOrder=descending"
         "&max_results=100"
     )
+    headers = {
+        # arXiv 要求 UA 里带项目名 / 联系方式
+        "User-Agent": "llm-notes-bot/1.0 (https://github.com/Snoworday/llm-notes)",
+        "Accept": "application/atom+xml",
+    }
     print(f"[arxiv] fetching: {url}")
-    req = urllib.request.Request(url, headers={"User-Agent": "llm-notes-bot/1.0"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = resp.read().decode("utf-8")
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (429, 503):
+                wait = min(60, 5 * (2 ** (attempt - 1)))  # 5,10,20,40,60
+                print(f"[arxiv] HTTP {e.code}, retry {attempt}/{max_retries} after {wait}s")
+                time.sleep(wait)
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            wait = 5 * attempt
+            print(f"[arxiv] error {e!r}, retry {attempt}/{max_retries} after {wait}s")
+            time.sleep(wait)
+    else:
+        raise RuntimeError(f"arxiv fetch failed after {max_retries} retries: {last_err}")
 
     ns = {"a": "http://www.w3.org/2005/Atom"}
     root = ET.fromstring(data)
@@ -77,7 +102,6 @@ def fetch_arxiv_papers():
         })
     print(f"[arxiv] got {len(papers)} entries")
     return papers
-
 
 def filter_papers(papers, processed_ids):
     """关键词过滤 + 去重"""
