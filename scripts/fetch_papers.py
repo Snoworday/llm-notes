@@ -1,29 +1,26 @@
 """
-每日自动抓取 arXiv 上 LLM 方向的最新论文,用 LLM 生成中文摘要,
+每日自动抓取 LLM 方向的最新论文,用 LLM 生成中文摘要,
 保存为 Markdown 文件到 content/papers/ 目录。
+
+数据源(按优先级):
+  1. Hugging Face Daily Papers - 社区精选,质量高,无频控
+  2. arXiv RSS - 备用源,无频控
+
+LLM 后端: OpenAI-compatible Chat Completions API
 """
 
 import os
 import re
 import time
 import json
-import hashlib
+import base64
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import urllib.request
-import urllib.parse
+import urllib.error
 import xml.etree.ElementTree as ET
 
 # ============ 配置 ============
-
-# arXiv 分类 + 关键词,只抓 LLM 相关
-ARXIV_CATEGORIES = ["cs.CL", "cs.AI", "cs.LG"]
-KEYWORDS = [
-    "large language model", "LLM", "transformer", "reasoning",
-    "agent", "RLHF", "DPO", "GRPO", "fine-tuning", "instruction tuning",
-    "in-context learning", "chain of thought", "mixture of experts",
-    "retrieval augmented", "RAG", "long context", "inference",
-]
 
 # 每天最多处理几篇(防止 API 配额爆掉)
 MAX_PAPERS_PER_RUN = 5
@@ -32,91 +29,159 @@ MAX_PAPERS_PER_RUN = 5
 OUTPUT_DIR = Path("content/papers")
 HISTORY_FILE = Path("scripts/.processed.json")
 
+# arXiv RSS 备用源(分类)
+ARXIV_RSS_CATEGORIES = ["cs.CL", "cs.AI", "cs.LG"]
+
+# 关键词过滤(用于 arXiv RSS 备用源)
+KEYWORDS = [
+    "large language model", "llm", "transformer", "reasoning",
+    "agent", "rlhf", "dpo", "grpo", "fine-tuning", "instruction tuning",
+    "in-context learning", "chain of thought", "mixture of experts",
+    "retrieval augmented", "rag", "long context", "inference",
+    "diffusion language", "alignment", "post-training",
+]
+
+# LLM API 配置 (OpenAI 兼容)
+LLM_API_URL = os.environ.get(
+    "LLM_API_URL", "https://api.openai.com/v1/chat/completions"
+)
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-# LLM API 配置 (DeepSeek)
-# LLM_API_URL = "https://api.deepseek.com/v1/chat/completions"
-# LLM_MODEL = "deepseek-chat"
-
-LLM_API_URL = "https://api.openai.com/v1/chat/completions"
-LLM_MODEL = "gpt-4o-mini"   # 或者 gpt-4o / gpt-4.1-mini
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
 
-# ============ arXiv 抓取 ============
+# ============ 通用 HTTP ============
 
-def fetch_arxiv_papers(max_retries=5):
-    """抓取最新的 arXiv 论文。带礼貌的 User-Agent 和指数退避重试。"""
-    cat_query = "+OR+".join(f"cat:{c}" for c in ARXIV_CATEGORIES)
-    url = (
-        "https://export.arxiv.org/api/query?"
-        f"search_query={cat_query}"
-        "&sortBy=submittedDate&sortOrder=descending"
-        "&max_results=100"
+def http_get(url, headers=None, timeout=60, max_retries=3):
+    """带重试的 GET"""
+    headers = headers or {}
+    headers.setdefault(
+        "User-Agent",
+        "llm-notes-bot/1.0 (https://github.com/Snoworday/llm-notes)",
     )
-    headers = {
-        # arXiv 要求 UA 里带项目名 / 联系方式
-        "User-Agent": "llm-notes-bot/1.0 (https://github.com/Snoworday/llm-notes)",
-        "Accept": "application/atom+xml",
-    }
-    print(f"[arxiv] fetching: {url}")
-
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = resp.read().decode("utf-8")
-            break
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code in (429, 503):
-                wait = min(60, 5 * (2 ** (attempt - 1)))  # 5,10,20,40,60
-                print(f"[arxiv] HTTP {e.code}, retry {attempt}/{max_retries} after {wait}s")
+                wait = 5 * (2 ** (attempt - 1))
+                print(f"[http] {url} -> HTTP {e.code}, retry {attempt}/{max_retries} after {wait}s")
                 time.sleep(wait)
                 continue
             raise
         except Exception as e:
             last_err = e
             wait = 5 * attempt
-            print(f"[arxiv] error {e!r}, retry {attempt}/{max_retries} after {wait}s")
+            print(f"[http] {url} -> {e!r}, retry {attempt}/{max_retries} after {wait}s")
             time.sleep(wait)
-    else:
-        raise RuntimeError(f"arxiv fetch failed after {max_retries} retries: {last_err}")
+    raise RuntimeError(f"failed after {max_retries} retries: {last_err}")
 
-    ns = {"a": "http://www.w3.org/2005/Atom"}
-    root = ET.fromstring(data)
-    papers = []
-    for entry in root.findall("a:entry", ns):
-        title = entry.find("a:title", ns).text.strip().replace("\n", " ")
-        title = re.sub(r"\s+", " ", title)
-        summary = entry.find("a:summary", ns).text.strip().replace("\n", " ")
-        summary = re.sub(r"\s+", " ", summary)
-        link = entry.find("a:id", ns).text.strip()
-        pub = entry.find("a:published", ns).text.strip()
-        authors = [a.find("a:name", ns).text for a in entry.findall("a:author", ns)]
-        papers.append({
-            "title": title,
-            "abstract": summary,
-            "link": link,
-            "published": pub,
-            "authors": authors[:5],
-        })
-    print(f"[arxiv] got {len(papers)} entries")
-    return papers
 
-def filter_papers(papers, processed_ids):
-    """关键词过滤 + 去重"""
-    filtered = []
-    for p in papers:
+# ============ 数据源 1: Hugging Face Daily Papers ============
+
+def fetch_hf_daily_papers():
+    """抓 Hugging Face Daily Papers, 抓最近 3 天 (有的天数没榜单)"""
+    all_papers = []
+    today = datetime.now(timezone(timedelta(hours=8)))
+    for day_offset in range(0, 4):
+        d = today - timedelta(days=day_offset)
+        date_str = d.strftime("%Y-%m-%d")
+        url = f"https://huggingface.co/api/daily_papers?date={date_str}"
+        try:
+            print(f"[hf] fetching {date_str}")
+            data = http_get(url)
+            items = json.loads(data)
+        except Exception as e:
+            print(f"[hf] {date_str} failed: {e}")
+            continue
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            p = it.get("paper") or {}
+            arxiv_id = p.get("id") or it.get("arxivId")
+            if not arxiv_id:
+                continue
+            authors = []
+            for a in p.get("authors", [])[:5]:
+                if isinstance(a, dict):
+                    authors.append(a.get("name", ""))
+                else:
+                    authors.append(str(a))
+            all_papers.append({
+                "id": arxiv_id,
+                "title": (p.get("title") or it.get("title") or "").strip(),
+                "abstract": (p.get("summary") or p.get("abstract") or "").strip(),
+                "link": f"https://arxiv.org/abs/{arxiv_id}",
+                "published": p.get("publishedAt") or it.get("publishedAt") or date_str,
+                "authors": authors,
+                "_source": "hf-daily",
+                "_hf_upvotes": p.get("upvotes", 0) or it.get("upvotes", 0),
+            })
+    # 去重 + 按 HF 热度排
+    seen = set()
+    uniq = []
+    for p in sorted(all_papers, key=lambda x: x.get("_hf_upvotes", 0), reverse=True):
+        if p["id"] in seen:
+            continue
+        seen.add(p["id"])
+        uniq.append(p)
+    print(f"[hf] got {len(uniq)} unique papers")
+    return uniq
+
+
+# ============ 数据源 2: arXiv RSS (备用) ============
+
+def fetch_arxiv_rss():
+    """从 arXiv RSS 拉取最新论文 (备用)"""
+    all_papers = []
+    for cat in ARXIV_RSS_CATEGORIES:
+        url = f"https://rss.arxiv.org/rss/{cat}"
+        try:
+            print(f"[arxiv-rss] fetching {cat}")
+            xml_data = http_get(url)
+        except Exception as e:
+            print(f"[arxiv-rss] {cat} failed: {e}")
+            continue
+        try:
+            root = ET.fromstring(xml_data)
+        except Exception as e:
+            print(f"[arxiv-rss] parse {cat} failed: {e}")
+            continue
+        for item in root.iter("item"):
+            title = (item.findtext("title") or "").strip().replace("\n", " ")
+            title = re.sub(r"\s+", " ", title)
+            desc = (item.findtext("description") or "").strip().replace("\n", " ")
+            desc = re.sub(r"\s+", " ", desc)
+            link = (item.findtext("link") or "").strip()
+            m = re.search(r"abs/(\d{4}\.\d{4,5})", link)
+            if not m:
+                continue
+            arxiv_id = m.group(1)
+            all_papers.append({
+                "id": arxiv_id,
+                "title": title,
+                "abstract": desc,
+                "link": link,
+                "published": item.findtext("pubDate") or "",
+                "authors": [],
+                "_source": "arxiv-rss",
+            })
+    # 去重 + 关键词过滤
+    seen = set()
+    uniq = []
+    for p in all_papers:
+        if p["id"] in seen:
+            continue
+        seen.add(p["id"])
         text = (p["title"] + " " + p["abstract"]).lower()
-        if not any(k.lower() in text for k in KEYWORDS):
+        if not any(k in text for k in KEYWORDS):
             continue
-        pid = p["link"].split("/")[-1]
-        if pid in processed_ids:
-            continue
-        p["id"] = pid
-        filtered.append(p)
-    print(f"[filter] {len(filtered)} new papers after filtering")
-    return filtered[:MAX_PAPERS_PER_RUN]
+        uniq.append(p)
+    print(f"[arxiv-rss] {len(uniq)} unique LLM papers after filtering")
+    return uniq
 
 
 # ============ LLM 摘要 ============
@@ -128,7 +193,7 @@ def llm_summarize(paper):
 论文标题: {paper['title']}
 论文摘要: {paper['abstract']}
 
-请按下面的格式输出 Markdown,不要有任何额外的解释:
+请按下面的格式输出 Markdown,不要有任何额外的解释或代码块包裹:
 
 ## 一句话总结
 (用一句话讲清楚这篇论文做了什么)
@@ -145,7 +210,6 @@ def llm_summarize(paper):
 ## 个人看法
 (这篇论文的意义、可能的应用场景、潜在局限)
 """
-
     payload = {
         "model": LLM_MODEL,
         "messages": [
@@ -163,7 +227,7 @@ def llm_summarize(paper):
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=180) as resp:
         result = json.loads(resp.read().decode("utf-8"))
     return result["choices"][0]["message"]["content"].strip()
 
@@ -173,20 +237,22 @@ def llm_summarize(paper):
 def slugify(title):
     s = re.sub(r"[^\w\s-]", "", title.lower())
     s = re.sub(r"[\s_-]+", "-", s).strip("-")
-    return s[:60]
+    return s[:50]
 
 
 def extract_tags(paper):
     text = (paper["title"] + " " + paper["abstract"]).lower()
     tag_map = {
-        "Reasoning": ["reasoning", "chain of thought", "cot"],
-        "RL": ["rlhf", "dpo", "grppo", "reinforcement"],
-        "Agent": ["agent", "tool use"],
-        "RAG": ["retrieval", "rag"],
-        "Inference": ["inference", "serving", "vllm"],
-        "MoE": ["mixture of experts", "moe"],
-        "Fine-tuning": ["fine-tuning", "sft", "instruction tuning"],
+        "Reasoning": ["reasoning", "chain of thought", "cot ", "cot,", "thinking"],
+        "RL": ["rlhf", "dpo", "grpo", "reinforcement"],
+        "Agent": ["agent", "tool use", "tool-use"],
+        "RAG": ["retrieval", "rag "],
+        "Inference": ["inference", "serving", "vllm", "kv cache"],
+        "MoE": ["mixture of experts", "moe "],
+        "Fine-tuning": ["fine-tuning", "instruction tuning", " sft "],
         "Long Context": ["long context", "long-context"],
+        "Alignment": ["alignment", "preference"],
+        "Multimodal": ["multimodal", "vision-language", "vlm"],
     }
     tags = []
     for tag, kws in tag_map.items():
@@ -199,22 +265,25 @@ def save_paper(paper, summary):
     today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     slug = f"{paper['id']}-{slugify(paper['title'])}"
     tags = extract_tags(paper)
-    safe_title = paper["title"].replace('"', "'")
-    safe_abs = paper["abstract"][:200].replace('"', "'").replace("\n", " ")
+    safe_title = paper["title"].replace('"', "'").replace("\\", " ")
+    abs_text = paper["abstract"][:180].replace('"', "'").replace("\n", " ")
 
     fm = (
         "---\n"
         f'title: "{safe_title}"\n'
         f'date: "{today}"\n'
-        f'summary: "{safe_abs}..."\n'
+        f'summary: "{abs_text}..."\n'
         f"tags: {json.dumps(tags)}\n"
         f'link: "{paper["link"]}"\n'
         "---\n\n"
     )
+    authors = ", ".join(paper["authors"]) if paper["authors"] else "(see arXiv)"
+    pub = (paper.get("published") or "")[:10]
     body = (
-        f"> **作者**: {', '.join(paper['authors'])}\n"
-        f"> **发布**: {paper['published'][:10]}\n"
-        f"> **arXiv**: [{paper['id']}]({paper['link']})\n\n"
+        f"> **作者**: {authors}\n"
+        f"> **发布**: {pub}\n"
+        f"> **arXiv**: [{paper['id']}]({paper['link']})\n"
+        f"> **来源**: {paper.get('_source', 'unknown')}\n\n"
         f"{summary}\n"
     )
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -244,8 +313,29 @@ def main():
         raise SystemExit("LLM_API_KEY not set")
 
     processed = load_history()
-    papers = fetch_arxiv_papers()
-    selected = filter_papers(papers, processed)
+    # 优先 HF Daily Papers
+    papers = []
+    try:
+        papers = fetch_hf_daily_papers()
+    except Exception as e:
+        print(f"[hf] failed entirely: {e}")
+    # 不足时用 arXiv RSS 补
+    if len(papers) < MAX_PAPERS_PER_RUN:
+        try:
+            papers += fetch_arxiv_rss()
+        except Exception as e:
+            print(f"[arxiv-rss] failed: {e}")
+
+    # 去重 + 去已处理
+    seen = set()
+    fresh = []
+    for p in papers:
+        if p["id"] in seen or p["id"] in processed:
+            continue
+        seen.add(p["id"])
+        fresh.append(p)
+    selected = fresh[:MAX_PAPERS_PER_RUN]
+    print(f"[main] {len(selected)} papers to process")
 
     if not selected:
         print("nothing new to process today")
@@ -259,7 +349,7 @@ def main():
             processed.add(p["id"])
             time.sleep(2)
         except Exception as e:
-            print(f"[error] {p['id']}: {e}")
+            print(f"[error] {p['id']}: {e!r}")
 
     save_history(processed)
     print("done")
