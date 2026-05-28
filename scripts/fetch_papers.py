@@ -43,10 +43,10 @@ KEYWORDS = [
 
 # LLM API 配置 (OpenAI 兼容)
 LLM_API_URL = os.environ.get(
-    "LLM_API_URL", "https://api.openai.com/v1/chat/completions"
+    "LLM_API_URL", "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 )
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+LLM_MODEL = os.environ.get("LLM_MODEL", "glm-4.5-flash")
 
 
 # ============ 通用 HTTP ============
